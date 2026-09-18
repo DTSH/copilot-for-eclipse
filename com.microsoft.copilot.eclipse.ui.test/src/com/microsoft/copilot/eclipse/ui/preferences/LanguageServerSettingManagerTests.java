@@ -16,6 +16,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 import com.google.gson.JsonObject;
 import org.eclipse.core.net.proxy.IProxyData;
@@ -34,6 +36,8 @@ import com.microsoft.copilot.eclipse.core.Constants;
 import com.microsoft.copilot.eclipse.core.lsp.CopilotLanguageServerConnection;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings.CopilotSettings;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateConversationToolsStatusParams;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateMcpToolsStatusParams;
 import com.microsoft.copilot.eclipse.core.utils.GsonUtils;
 import com.microsoft.copilot.eclipse.core.utils.PlatformUtils;
 import com.microsoft.copilot.eclipse.ui.CopilotUi;
@@ -274,6 +278,61 @@ class LanguageServerSettingManagerTests {
     verify(mockPreferenceStore, times(1)).getString(Constants.MCP_TOOLS_MODE_STATUS);
     verify(mockPreferenceStore, times(1)).getString(Constants.MCP_TOOLS_STATUS);
     verify(mockLsConnection, times(0)).updateMcpToolsStatus(any());
+  }
+
+  @Test
+  void testUpdateToolStatusForMode_customAgentSkipsBuiltInConversationStatus() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockLsConnection.updateMcpToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(List.of()));
+    when(mockLsConnection.updateConversationToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(new Object()));
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+    String customModeId = "file:///C:/workspace/.github/agents/test.agent.md";
+    String toolStatusJson = "{\"Built-in Tools\":{\"file_search\":false},"
+        + "\"custom-mcp\":{\"file_search\":true}}";
+
+    manager.updateToolStatusForMode(toolStatusJson, customModeId);
+
+    ArgumentCaptor<UpdateMcpToolsStatusParams> mcpParamsCaptor = ArgumentCaptor
+        .forClass(UpdateMcpToolsStatusParams.class);
+    verify(mockLsConnection).updateMcpToolsStatus(mcpParamsCaptor.capture());
+    verify(mockLsConnection, times(0))
+        .updateConversationToolsStatus(any(UpdateConversationToolsStatusParams.class));
+
+    UpdateMcpToolsStatusParams params = mcpParamsCaptor.getValue();
+    assertEquals(customModeId, params.getCustomChatModeId());
+    assertEquals(1, params.getServers().size());
+    assertEquals("custom-mcp", params.getServers().get(0).getName());
+    assertEquals(1, params.getServers().get(0).getTools().size());
+    assertEquals("file_search", params.getServers().get(0).getTools().get(0).getName());
+    assertEquals("enabled", params.getServers().get(0).getTools().get(0).getStatus());
+  }
+
+  @Test
+  void testUpdateToolStatusForMode_agentModeSendsBuiltInConversationStatus() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockLsConnection.updateMcpToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(List.of()));
+    when(mockLsConnection.updateConversationToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(new Object()));
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+
+    manager.updateToolStatusForMode("{\"Built-in Tools\":{\"file_search\":false}}", "agent-mode");
+
+    verify(mockLsConnection, times(0)).updateMcpToolsStatus(any(UpdateMcpToolsStatusParams.class));
+    ArgumentCaptor<UpdateConversationToolsStatusParams> paramsCaptor = ArgumentCaptor
+        .forClass(UpdateConversationToolsStatusParams.class);
+    verify(mockLsConnection).updateConversationToolsStatus(paramsCaptor.capture());
+
+    UpdateConversationToolsStatusParams params = paramsCaptor.getValue();
+    assertEquals("Agent", params.getChatModeKind());
+    assertNull(params.getCustomChatModeId());
+    assertEquals(1, params.getTools().size());
+    assertEquals("file_search", params.getTools().get(0).getName());
+    assertEquals("disabled", params.getTools().get(0).getStatus());
   }
 
   @Test

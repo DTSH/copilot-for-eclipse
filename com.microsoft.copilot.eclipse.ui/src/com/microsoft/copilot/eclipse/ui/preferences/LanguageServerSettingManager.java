@@ -391,6 +391,10 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
     updateMcpToolsStatus(toolStatusJson, modeId);
   }
 
+  private static boolean isCustomModeId(String modeId) {
+    return modeId != null && modeId.startsWith("file://");
+  }
+
   /**
    * Updates the MCP tools status.
    *
@@ -420,7 +424,7 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
 
     // Set custom mode ID only if this is for a custom mode (ID starts with "file://")
     // For built-in agent mode, customChatModeId should not be set
-    if (modeId != null && modeId.startsWith("file://")) {
+    if (isCustomModeId(modeId)) {
       mcpParams.setCustomChatModeId(modeId);
     }
 
@@ -465,15 +469,16 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
       updateMcpToolsStatusFuture = this.copilotLanguageServerConnection.updateMcpToolsStatus(mcpParams);
     }
 
-    // Update built-in tools using conversation/updateToolsStatus
-    if (builtInTools != null && !builtInTools.isEmpty()) {
+    // Custom-agent tools are written to .agent.md directly. The conversation endpoint only receives
+    // tool names, so a built-in tool like "file_search" would also match an MCP tool with the same name.
+    if (!isCustomModeId(modeId) && builtInTools != null && !builtInTools.isEmpty()) {
       UpdateConversationToolsStatusParams conversationParams = new UpdateConversationToolsStatusParams();
       conversationParams.setChatModeKind("Agent");
       conversationParams.setWorkspaceFolders(WorkspaceUtils.listWorkspaceFolders());
 
       // Set custom mode ID only if this is for a custom mode (ID starts with "file://")
       // For built-in agent mode, customChatModeId should not be set
-      if (modeId != null && modeId.startsWith("file://")) {
+      if (isCustomModeId(modeId)) {
         conversationParams.setCustomChatModeId(modeId);
       }
 
