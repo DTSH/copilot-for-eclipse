@@ -690,7 +690,7 @@ public class ActionBar extends Composite implements NewConversationListener {
       return false;
     }
 
-    // Get the active mode and check if java_debugger is in its tools list from CLS
+    // Get the active mode and check its effective tool selection.
     String activeModeId = chatServiceManager.getUserPreferenceService().getActiveModeNameOrId();
     if (activeModeId == null) {
       return false;
@@ -705,7 +705,8 @@ public class ActionBar extends Composite implements NewConversationListener {
     // Check custom modes
     CustomChatMode customMode = CustomChatModeManager.INSTANCE.getCustomModeById(activeModeId);
     if (customMode != null) {
-      return customMode.getTools().contains(JavaDebuggerToolAdapter.TOOL_NAME);
+      return CopilotUi.getPlugin().getLanguageServerSettingManager()
+          .isBuiltInToolEnabledForMode(customMode.getId(), JavaDebuggerToolAdapter.TOOL_NAME);
     }
 
     return false;

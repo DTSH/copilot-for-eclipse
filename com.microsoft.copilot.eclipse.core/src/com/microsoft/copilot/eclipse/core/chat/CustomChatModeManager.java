@@ -8,6 +8,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.microsoft.copilot.eclipse.core.CopilotCore;
 import com.microsoft.copilot.eclipse.core.FeatureFlags;
@@ -21,9 +22,9 @@ import com.microsoft.copilot.eclipse.core.chat.service.ICustomModeService;
 public enum CustomChatModeManager {
   INSTANCE;
 
-  private static final String SEPARATOR_PREFIX = "---";
   private List<CustomChatMode> customModes;
   private final ICustomModeService customModeService;
+  private final AtomicLong loadGeneration = new AtomicLong();
 
   CustomChatModeManager() {
     this.customModeService = new FileBasedCustomModeService();
@@ -37,13 +38,18 @@ public enum CustomChatModeManager {
    * blocking the UI thread.
    */
   private void startAsyncLoad() {
+    long generation = loadGeneration.incrementAndGet();
     CompletableFuture.runAsync(() -> {
       try {
         List<CustomChatMode> modes = customModeService.loadCustomModes().join();
-        customModes = new CopyOnWriteArrayList<>(modes);
+        if (generation == loadGeneration.get()) {
+          customModes = new CopyOnWriteArrayList<>(modes);
+        }
       } catch (Exception e) {
         CopilotCore.LOGGER.error("Failed to load custom modes on initialization", e);
-        customModes = new CopyOnWriteArrayList<>();
+        if (generation == loadGeneration.get()) {
+          customModes = new CopyOnWriteArrayList<>();
+        }
       }
     });
   }
@@ -66,8 +72,11 @@ public enum CustomChatModeManager {
    * @return a future indicating completion
    */
   public CompletableFuture<Void> syncCustomModesFromService() {
+    long generation = loadGeneration.incrementAndGet();
     return customModeService.loadCustomModes().thenAccept(modes -> {
-      customModes = new CopyOnWriteArrayList<>(modes);
+      if (generation == loadGeneration.get()) {
+        customModes = new CopyOnWriteArrayList<>(modes);
+      }
     }).exceptionally(ex -> {
       CopilotCore.LOGGER.error("Failed to sync custom modes, keeping previous list", ex);
       // Return null to complete the future normally, preserving the previous mode list

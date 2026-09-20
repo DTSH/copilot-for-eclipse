@@ -139,6 +139,9 @@ public class AgentToolService implements ToolInvocationListener, TerminalService
 
     return lsConnection.registerTools(registerToolsParams).thenApply(toolList -> {
       cachedBuiltInTools = toolList;
+      if (CopilotUi.getPlugin().getLanguageServerSettingManager() != null) {
+        CopilotUi.getPlugin().getLanguageServerSettingManager().updateAvailableBuiltInTools(toolList);
+      }
       return toolList;
     });
   }

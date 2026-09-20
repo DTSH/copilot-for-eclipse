@@ -3,12 +3,15 @@
 
 package com.microsoft.copilot.eclipse.core.chat;
 
+import java.util.List;
+
 import com.microsoft.copilot.eclipse.core.lsp.protocol.ConversationMode;
 
 /**
  * Represents a custom chat mode created by the user.
  */
 public class CustomChatMode extends BaseChatMode {
+  private boolean hasExplicitToolList;
 
   /**
    * Constructor for CustomChatMode.
@@ -19,6 +22,7 @@ public class CustomChatMode extends BaseChatMode {
    */
   public CustomChatMode(String id, String displayName, String description) {
     super(id, displayName, description);
+    this.hasExplicitToolList = true;
   }
 
   /**
@@ -29,7 +33,23 @@ public class CustomChatMode extends BaseChatMode {
    */
   public CustomChatMode(ConversationMode mode) {
     super(mode.getId(), mode.getName(), mode.getDescription(),
-          mode.getCustomTools(), mode.getModel(), mode.getHandOffs());
+        mode.getCustomTools(), mode.getModel(), mode.getHandOffs());
+    this.hasExplicitToolList = mode.getCustomTools() != null;
+  }
+
+  /**
+   * Gibt an, ob die Agent-Datei eine explizite {@code tools}-Liste enthält.
+   *
+   * @return {@code true}, wenn {@code tools} in der Agent-Definition vorhanden ist
+   */
+  public boolean hasExplicitToolList() {
+    return hasExplicitToolList;
+  }
+
+  @Override
+  public void setTools(List<String> tools) {
+    super.setTools(tools);
+    this.hasExplicitToolList = tools != null;
   }
 
   @Override

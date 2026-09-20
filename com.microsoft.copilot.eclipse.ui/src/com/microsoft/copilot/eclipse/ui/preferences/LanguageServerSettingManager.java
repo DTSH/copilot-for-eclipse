@@ -5,6 +5,7 @@ package com.microsoft.copilot.eclipse.ui.preferences;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,17 +29,19 @@ import org.eclipse.ui.PlatformUI;
 import com.microsoft.copilot.eclipse.core.Constants;
 import com.microsoft.copilot.eclipse.core.CopilotCore;
 import com.microsoft.copilot.eclipse.core.FeatureFlags;
-import com.microsoft.copilot.eclipse.core.chat.CustomChatModeManager;
+import com.microsoft.copilot.eclipse.core.chat.CustomChatMode;
 import com.microsoft.copilot.eclipse.core.chat.FileOperationAutoApproveRule;
 import com.microsoft.copilot.eclipse.core.chat.TerminalAutoApproveRule;
 import com.microsoft.copilot.eclipse.core.events.CopilotEventConstants;
 import com.microsoft.copilot.eclipse.core.lsp.CopilotLanguageServerConnection;
+import com.microsoft.copilot.eclipse.core.lsp.mcp.McpServerToolsCollection;
 import com.microsoft.copilot.eclipse.core.lsp.mcp.McpServerToolsStatusCollection;
 import com.microsoft.copilot.eclipse.core.lsp.mcp.McpToolStatus;
 import com.microsoft.copilot.eclipse.core.lsp.mcp.McpToolsStatusCollection;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.ConversationToolStatus;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings.GitHubSettings;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.LanguageModelToolInformation;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateConversationToolsStatusParams;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateMcpToolsStatusParams;
 import com.microsoft.copilot.eclipse.core.utils.GsonUtils;
@@ -58,6 +61,10 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
   IPreferenceStore preferenceStore;
   IProxyData proxyData = null;
   private IEventBroker eventBroker;
+  private Map<String, Boolean> availableBuiltInToolStatus;
+  private Map<String, Map<String, Boolean>> availableMcpToolStatus;
+  private List<CustomChatMode> customModes = List.of();
+  private boolean mcpToolStatusInitialized;
 
   /**
    * Gets the settings.
@@ -334,10 +341,9 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
   }
 
   /**
-   * Initializes the MCP tools status from the preference store for built-in agent mode only.
-   * Custom agent modes get their tool configuration from the LSP/file, not from preferences.
+   * Initializes every mode's MCP tools status from its own preference entry.
    */
-  public void initializeMcpToolsStatus() {
+  public synchronized void initializeMcpToolsStatus() {
     // Load per-mode tool status
     String savedModeToolsStatus = preferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS);
 
@@ -347,19 +353,14 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
             .fromJson(savedModeToolsStatus, new TypeToken<Map<String, Map<String, Map<String, Boolean>>>>() {
             }.getType());
 
-        // Only initialize tool status for built-in agent mode, not custom modes.
-        // Custom modes get their tool configuration from the LSP/file, not from preferences.
-        for (Map.Entry<String, Map<String, Map<String, Boolean>>> modeEntry : modeToolStatus.entrySet()) {
-          String modeId = modeEntry.getKey();
-
-          // Skip custom agent modes - they should use tool configuration from their file/LSP
-          if (CustomChatModeManager.INSTANCE.isCustomMode(modeId)) {
-            continue;
+        if (modeToolStatus != null) {
+          for (Map.Entry<String, Map<String, Map<String, Boolean>>> modeEntry : modeToolStatus.entrySet()) {
+            if (StringUtils.isBlank(modeEntry.getKey()) || modeEntry.getValue() == null) {
+              continue;
+            }
+            String toolStatusJson = GsonUtils.getDefault().toJson(modeEntry.getValue());
+            updateToolStatusForMode(toolStatusJson, modeEntry.getKey());
           }
-
-          Map<String, Map<String, Boolean>> toolStatus = modeEntry.getValue();
-          String toolStatusJson = GsonUtils.getDefault().toJson(toolStatus);
-          updateToolStatusForMode(toolStatusJson, modeId);
         }
       } catch (Exception e) {
         CopilotCore.LOGGER.error("Failed to parse MCP mode tools status JSON", e);
@@ -369,6 +370,7 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
       String savedMcpToolsStatus = preferenceStore.getString(Constants.MCP_TOOLS_STATUS);
       updateMcpToolsStatus(savedMcpToolsStatus, null);
     }
+    mcpToolStatusInitialized = true;
   }
 
   /**
@@ -382,13 +384,160 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
   }
 
   /**
-   * Update tool status for a specific mode.
+   * Synchronizes the stored tool selection with the custom-agent definitions. An explicit {@code tools} property always
+   * replaces the corresponding mode preference, including an explicitly empty list. Without that property, an existing
+   * preference remains authoritative; a missing preference enables every available tool once the complete inventory is
+   * known.
+   *
+   * @param customModes the currently loaded custom agents
+   */
+  public synchronized void synchronizeCustomAgentToolPreferences(Iterable<CustomChatMode> customModes) {
+    this.customModes = new ArrayList<>();
+    customModes.forEach(this.customModes::add);
+    updateCustomAgentToolPreferences();
+  }
+
+  /**
+   * Updates the available built-in tools used to initialize new custom agents.
+   *
+   * @param builtInTools the currently available built-in tools
+   */
+  public synchronized void updateAvailableBuiltInTools(
+      Iterable<? extends LanguageModelToolInformation> builtInTools) {
+    availableBuiltInToolStatus = collectToolStatus(builtInTools);
+    updateCustomAgentToolPreferences();
+  }
+
+  /**
+   * Updates the available MCP tools used to initialize new custom agents.
+   *
+   * @param servers the currently available MCP servers and tools
+   */
+  public synchronized void updateAvailableMcpTools(Iterable<McpServerToolsCollection> servers) {
+    availableMcpToolStatus = new HashMap<>();
+    if (servers != null) {
+      for (McpServerToolsCollection server : servers) {
+        if (server == null || StringUtils.isBlank(server.getName())) {
+          continue;
+        }
+        Map<String, Boolean> toolStatus = collectToolStatus(server.getTools());
+        if (!toolStatus.isEmpty()) {
+          availableMcpToolStatus.put(server.getName(), toolStatus);
+        }
+      }
+    }
+    updateCustomAgentToolPreferences();
+  }
+
+  private void updateCustomAgentToolPreferences() {
+    String savedModeToolsStatus = preferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS);
+    Map<String, Map<String, Map<String, Boolean>>> modeToolStatus = new HashMap<>();
+    if (StringUtils.isNotBlank(savedModeToolsStatus)) {
+      try {
+        Map<String, Map<String, Map<String, Boolean>>> savedStatus = GsonUtils.getDefault()
+            .fromJson(savedModeToolsStatus, new TypeToken<Map<String, Map<String, Map<String, Boolean>>>>() {
+            }.getType());
+        if (savedStatus != null) {
+          modeToolStatus.putAll(savedStatus);
+        }
+      } catch (JsonSyntaxException e) {
+        CopilotCore.LOGGER.error("Failed to parse MCP mode tools status JSON", e);
+        return;
+      }
+    }
+
+    boolean changed = CustomAgentToolStatusResolver.synchronizeModePreferences(modeToolStatus, customModes,
+        Messages.preferences_page_mcp_tools_builtin, getAvailableToolStatus());
+    if (changed) {
+      preferenceStore.setValue(Constants.MCP_TOOLS_MODE_STATUS, GsonUtils.getDefault().toJson(modeToolStatus));
+      if (mcpToolStatusInitialized) {
+        for (CustomChatMode customMode : customModes) {
+          Map<String, Map<String, Boolean>> toolStatus = modeToolStatus.get(customMode.getId());
+          if (toolStatus != null) {
+            updateToolStatusForMode(GsonUtils.getDefault().toJson(toolStatus), customMode.getId());
+          }
+        }
+      }
+    }
+  }
+
+  private Map<String, Map<String, Boolean>> getAvailableToolStatus() {
+    if (availableBuiltInToolStatus == null || availableMcpToolStatus == null) {
+      return null;
+    }
+
+    Map<String, Map<String, Boolean>> availableToolStatus = new HashMap<>();
+    if (!availableBuiltInToolStatus.isEmpty()) {
+      availableToolStatus.put(Messages.preferences_page_mcp_tools_builtin,
+          new HashMap<>(availableBuiltInToolStatus));
+    }
+    availableMcpToolStatus.forEach((serverName, toolStatus) ->
+        availableToolStatus.put(serverName, new HashMap<>(toolStatus)));
+    return availableToolStatus;
+  }
+
+  private Map<String, Boolean> collectToolStatus(
+      Iterable<? extends LanguageModelToolInformation> tools) {
+    Map<String, Boolean> toolStatus = new HashMap<>();
+    if (tools != null) {
+      for (LanguageModelToolInformation tool : tools) {
+        if (tool != null && StringUtils.isNotBlank(tool.getName())) {
+          toolStatus.put(tool.getName(), true);
+        }
+      }
+    }
+    return toolStatus;
+  }
+
+  /**
+   * Checks whether a built-in tool is enabled in a mode's own preference entry.
+   *
+   * @param modeId the mode ID
+   * @param toolName the built-in tool name
+   * @return {@code true} if the mode-specific preference explicitly enables the tool
+   */
+  public boolean isBuiltInToolEnabledForMode(String modeId, String toolName) {
+    if (StringUtils.isAnyBlank(modeId, toolName)) {
+      return false;
+    }
+
+    String savedModeToolsStatus = preferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS);
+    if (StringUtils.isBlank(savedModeToolsStatus)) {
+      return false;
+    }
+
+    try {
+      Map<String, Map<String, Map<String, Boolean>>> modeToolStatus = GsonUtils.getDefault()
+          .fromJson(savedModeToolsStatus, new TypeToken<Map<String, Map<String, Map<String, Boolean>>>>() {
+          }.getType());
+      if (modeToolStatus == null) {
+        return false;
+      }
+
+      Map<String, Map<String, Boolean>> selectedModeStatus = modeToolStatus.get(modeId);
+      if (selectedModeStatus == null) {
+        return false;
+      }
+      Map<String, Boolean> builtInTools = selectedModeStatus.get(Messages.preferences_page_mcp_tools_builtin);
+      return builtInTools != null && Boolean.TRUE.equals(builtInTools.get(toolName));
+    } catch (JsonSyntaxException e) {
+      CopilotCore.LOGGER.error("Failed to parse MCP mode tools status JSON", e);
+      return false;
+    }
+  }
+
+  /**
+   * Updates tool status for a specific mode.
    *
    * @param toolStatusJson the tool status in JSON format for this mode
-   * @param modeId the mode ID ("agent-mode" for built-in agent mode, or "file://..." for custom modes)
+   * @param modeId the mode ID ({@code agent-mode} or a {@code file://} custom-agent ID)
    */
   public void updateToolStatusForMode(String toolStatusJson, String modeId) {
     updateMcpToolsStatus(toolStatusJson, modeId);
+  }
+
+  private static boolean isCustomModeId(String modeId) {
+    return modeId != null && modeId.startsWith("file://");
   }
 
   /**
@@ -418,9 +567,7 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
     mcpParams.setServers(serverList);
     mcpParams.setWorkspaceFolders(WorkspaceUtils.listWorkspaceFolders());
 
-    // Set custom mode ID only if this is for a custom mode (ID starts with "file://")
-    // For built-in agent mode, customChatModeId should not be set
-    if (modeId != null && modeId.startsWith("file://")) {
+    if (isCustomModeId(modeId)) {
       mcpParams.setCustomChatModeId(modeId);
     }
 
@@ -465,15 +612,13 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
       updateMcpToolsStatusFuture = this.copilotLanguageServerConnection.updateMcpToolsStatus(mcpParams);
     }
 
-    // Update built-in tools using conversation/updateToolsStatus
+    // Update built-in tools using conversation/updateToolsStatus.
     if (builtInTools != null && !builtInTools.isEmpty()) {
       UpdateConversationToolsStatusParams conversationParams = new UpdateConversationToolsStatusParams();
       conversationParams.setChatModeKind("Agent");
       conversationParams.setWorkspaceFolders(WorkspaceUtils.listWorkspaceFolders());
 
-      // Set custom mode ID only if this is for a custom mode (ID starts with "file://")
-      // For built-in agent mode, customChatModeId should not be set
-      if (modeId != null && modeId.startsWith("file://")) {
+      if (isCustomModeId(modeId)) {
         conversationParams.setCustomChatModeId(modeId);
       }
 

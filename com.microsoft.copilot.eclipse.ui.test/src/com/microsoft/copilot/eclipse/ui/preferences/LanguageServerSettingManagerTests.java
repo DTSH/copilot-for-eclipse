@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
@@ -16,6 +17,9 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 import com.google.gson.JsonObject;
 import org.eclipse.core.net.proxy.IProxyData;
@@ -31,9 +35,16 @@ import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
 import com.microsoft.copilot.eclipse.core.Constants;
+import com.microsoft.copilot.eclipse.core.chat.CustomChatMode;
 import com.microsoft.copilot.eclipse.core.lsp.CopilotLanguageServerConnection;
+import com.microsoft.copilot.eclipse.core.lsp.mcp.McpServerToolsCollection;
+import com.microsoft.copilot.eclipse.core.lsp.mcp.McpToolInformation;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.ConversationMode;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings.CopilotSettings;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.LanguageModelToolInformation;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateConversationToolsStatusParams;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateMcpToolsStatusParams;
 import com.microsoft.copilot.eclipse.core.utils.GsonUtils;
 import com.microsoft.copilot.eclipse.core.utils.PlatformUtils;
 import com.microsoft.copilot.eclipse.ui.CopilotUi;
@@ -277,6 +288,176 @@ class LanguageServerSettingManagerTests {
   }
 
   @Test
+  void testUpdateToolStatusForMode_customAgentSendsModeIdToAllStatusUpdates() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockLsConnection.updateMcpToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(List.of()));
+    when(mockLsConnection.updateConversationToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(new Object()));
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+    String customModeId = "file:///C:/workspace/.github/agents/test.agent.md";
+    String toolStatusJson = "{\"Built-in Tools\":{\"file_search\":false},"
+        + "\"custom-mcp\":{\"file_search\":true}}";
+
+    manager.updateToolStatusForMode(toolStatusJson, customModeId);
+
+    ArgumentCaptor<UpdateMcpToolsStatusParams> mcpParamsCaptor = ArgumentCaptor
+        .forClass(UpdateMcpToolsStatusParams.class);
+    verify(mockLsConnection).updateMcpToolsStatus(mcpParamsCaptor.capture());
+    assertEquals(customModeId, mcpParamsCaptor.getValue().getCustomChatModeId());
+
+    ArgumentCaptor<UpdateConversationToolsStatusParams> conversationParamsCaptor = ArgumentCaptor
+        .forClass(UpdateConversationToolsStatusParams.class);
+    verify(mockLsConnection).updateConversationToolsStatus(conversationParamsCaptor.capture());
+    assertEquals(customModeId, conversationParamsCaptor.getValue().getCustomChatModeId());
+    assertEquals("disabled", conversationParamsCaptor.getValue().getTools().get(0).getStatus());
+  }
+
+  @Test
+  void testInitializeMcpToolsStatus_multipleModesUseTheirOwnPreferences() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockLsConnection.updateConversationToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(new Object()));
+    String firstCustomModeId = "file:///C:/workspace/.github/agents/first.agent.md";
+    String secondCustomModeId = "file:///C:/workspace/.github/agents/second.agent.md";
+    String modeToolStatusJson = "{\"agent-mode\":{\"Built-in Tools\":{\"java_debugger\":true}},"
+        + "\"" + firstCustomModeId + "\":{\"Built-in Tools\":{\"java_debugger\":false}},"
+        + "\"" + secondCustomModeId + "\":{\"Built-in Tools\":{\"java_debugger\":true}}}";
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn(modeToolStatusJson);
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+
+    manager.initializeMcpToolsStatus();
+
+    ArgumentCaptor<UpdateConversationToolsStatusParams> paramsCaptor = ArgumentCaptor
+        .forClass(UpdateConversationToolsStatusParams.class);
+    verify(mockLsConnection, times(3)).updateConversationToolsStatus(paramsCaptor.capture());
+    UpdateConversationToolsStatusParams firstCustomParams = paramsCaptor.getAllValues().stream()
+        .filter(params -> firstCustomModeId.equals(params.getCustomChatModeId()))
+        .findFirst()
+        .orElseThrow();
+    UpdateConversationToolsStatusParams secondCustomParams = paramsCaptor.getAllValues().stream()
+        .filter(params -> secondCustomModeId.equals(params.getCustomChatModeId()))
+        .findFirst()
+        .orElseThrow();
+    assertEquals("disabled", firstCustomParams.getTools().get(0).getStatus());
+    assertEquals("enabled", secondCustomParams.getTools().get(0).getStatus());
+  }
+
+  @Test
+  void testSynchronizeCustomAgentToolPreferences_explicitToolsReplaceOnlyCustomAgentStatus() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    String customModeId = "file:///C:/workspace/.github/agents/test.agent.md";
+    String modeToolStatusJson = "{\"agent-mode\":{\"Built-in Tools\":{\"java_debugger\":true}},"
+        + "\"" + customModeId + "\":{\"Built-in Tools\":{\"read_file\":false}}}";
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn(modeToolStatusJson);
+    ConversationMode conversationMode = new ConversationMode();
+    conversationMode.setId(customModeId);
+    conversationMode.setName("Test Agent");
+    conversationMode.setCustomTools(List.of("run_in_terminal"));
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+    manager.updateAvailableBuiltInTools(List.of(createTool("java_debugger"), createTool("run_in_terminal")));
+    manager.updateAvailableMcpTools(List.of(createMcpServer("custom-mcp", "search")));
+
+    manager.synchronizeCustomAgentToolPreferences(List.of(new CustomChatMode(conversationMode)));
+
+    ArgumentCaptor<String> statusCaptor = ArgumentCaptor.forClass(String.class);
+    verify(mockPreferenceStore).setValue(eq(Constants.MCP_TOOLS_MODE_STATUS), statusCaptor.capture());
+    Map<?, ?> persistedStatus = GsonUtils.getDefault().fromJson(statusCaptor.getValue(), Map.class);
+    assertEquals(Map.of("Built-in Tools", Map.of("java_debugger", true)), persistedStatus.get("agent-mode"));
+    assertEquals(Map.of(
+        "Built-in Tools", Map.of("java_debugger", false, "run_in_terminal", true),
+        "custom-mcp", Map.of("search", false)), persistedStatus.get(customModeId));
+  }
+
+  @Test
+  void testSynchronizeCustomAgentToolPreferences_missingToolsExistingStatusIsNotOverwritten() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    String customModeId = "file:///C:/workspace/.github/agents/test.agent.md";
+    String modeToolStatusJson = "{\"" + customModeId
+        + "\":{\"Built-in Tools\":{\"run_in_terminal\":true}}}";
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn(modeToolStatusJson);
+    ConversationMode conversationMode = new ConversationMode();
+    conversationMode.setId(customModeId);
+    conversationMode.setName("Test Agent");
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+    manager.updateAvailableBuiltInTools(List.of(createTool("read_file"), createTool("run_in_terminal")));
+    manager.updateAvailableMcpTools(List.of());
+
+    manager.synchronizeCustomAgentToolPreferences(List.of(new CustomChatMode(conversationMode)));
+
+    verify(mockPreferenceStore, times(0)).setValue(eq(Constants.MCP_TOOLS_MODE_STATUS), any(String.class));
+  }
+
+  @Test
+  void testSynchronizeCustomAgentToolPreferences_missingToolsWaitsThenEnablesCompleteInventory() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn("");
+    String customModeId = "file:///C:/workspace/.github/agents/test.agent.md";
+    ConversationMode conversationMode = new ConversationMode();
+    conversationMode.setId(customModeId);
+    conversationMode.setName("Test Agent");
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+
+    manager.synchronizeCustomAgentToolPreferences(List.of(new CustomChatMode(conversationMode)));
+    manager.updateAvailableBuiltInTools(List.of(createTool("read_file")));
+
+    verify(mockPreferenceStore, times(0)).setValue(eq(Constants.MCP_TOOLS_MODE_STATUS), any(String.class));
+
+    manager.updateAvailableMcpTools(List.of(createMcpServer("custom-mcp", "search")));
+
+    ArgumentCaptor<String> statusCaptor = ArgumentCaptor.forClass(String.class);
+    verify(mockPreferenceStore).setValue(eq(Constants.MCP_TOOLS_MODE_STATUS), statusCaptor.capture());
+    Map<?, ?> persistedStatus = GsonUtils.getDefault().fromJson(statusCaptor.getValue(), Map.class);
+    assertEquals(Map.of(
+        "Built-in Tools", Map.of("read_file", true),
+        "custom-mcp", Map.of("search", true)), persistedStatus.get(customModeId));
+  }
+
+  @Test
+  void testIsBuiltInToolEnabledForMode_customAgentDoesNotInheritAgentModePreference() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    String customModeId = "file:///C:/workspace/.github/agents/test.agent.md";
+    String modeToolStatusJson = "{\"agent-mode\":{\"Built-in Tools\":{\"java_debugger\":true}}}";
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn(modeToolStatusJson);
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+
+    boolean customAgentEnabled = manager.isBuiltInToolEnabledForMode(customModeId, "java_debugger");
+
+    assertFalse(customAgentEnabled);
+  }
+
+  @Test
+  void testUpdateToolStatusForMode_agentModeSendsBuiltInConversationStatus() {
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockLsConnection.updateMcpToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(List.of()));
+    when(mockLsConnection.updateConversationToolsStatus(any()))
+        .thenReturn(CompletableFuture.completedFuture(new Object()));
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+
+    manager.updateToolStatusForMode("{\"Built-in Tools\":{\"file_search\":false}}", "agent-mode");
+
+    verify(mockLsConnection, times(0)).updateMcpToolsStatus(any(UpdateMcpToolsStatusParams.class));
+    ArgumentCaptor<UpdateConversationToolsStatusParams> paramsCaptor = ArgumentCaptor
+        .forClass(UpdateConversationToolsStatusParams.class);
+    verify(mockLsConnection).updateConversationToolsStatus(paramsCaptor.capture());
+
+    UpdateConversationToolsStatusParams params = paramsCaptor.getValue();
+    assertEquals("Agent", params.getChatModeKind());
+    assertNull(params.getCustomChatModeId());
+    assertEquals(1, params.getTools().size());
+    assertEquals("file_search", params.getTools().get(0).getName());
+    assertEquals("disabled", params.getTools().get(0).getStatus());
+  }
+
+  @Test
   void testProxyWithNoProxyHosts() {
     // Verifies noProxy bypass list is transmitted when proxy is configured
     // This fixes the issue where internal MCP servers couldn't bypass proxy
@@ -331,5 +512,22 @@ class LanguageServerSettingManagerTests {
     CopilotLanguageServerSettings settings = manager.getSettings();
     assertEquals("HTTPS://proxy.example.com:3128", settings.getHttp().getProxy());
     assertEquals("testuser:testpass", settings.getHttp().getProxyAuthorization());
+  }
+
+  private LanguageModelToolInformation createTool(String name) {
+    LanguageModelToolInformation tool = new LanguageModelToolInformation();
+    tool.setName(name);
+    return tool;
+  }
+
+  private McpServerToolsCollection createMcpServer(String serverName, String... toolNames) {
+    McpServerToolsCollection server = new McpServerToolsCollection();
+    server.setName(serverName);
+    server.setTools(List.of(toolNames).stream().map(name -> {
+      McpToolInformation tool = new McpToolInformation();
+      tool.setName(name);
+      return tool;
+    }).toList());
+    return server;
   }
 }

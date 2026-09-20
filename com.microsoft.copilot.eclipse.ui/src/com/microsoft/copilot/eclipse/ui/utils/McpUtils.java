@@ -27,12 +27,15 @@ import com.microsoft.copilot.eclipse.ui.preferences.CopilotPreferenceInitializer
  * Utility class for handling MCP related operations.
  */
 public class McpUtils {
+  private static final String INVALID_ALLOWLIST_FORMAT_PREFIX = "Invalid allowlist format:";
+
   /**
    * Get the MCP allowlist from the Copilot Language Server connection. This method retrieves the allowlist which
    * contains the MCP registry entries and their access modes.
    *
    * @param copilotLanguageServerConnection The Copilot Language Server connection to use for retrieving the allowlist
-   * @return CompletableFuture containing the MCP allowlist, or null if no connection is available
+   * @return CompletableFuture containing the MCP allowlist, or {@code null} if no connection or no valid allowlist is
+   *     available
    */
   public static CompletableFuture<McpRegistryAllowList> getMcpAllowList(
       CopilotLanguageServerConnection copilotLanguageServerConnection) {
@@ -43,7 +46,26 @@ public class McpUtils {
     }
 
     // Retrieve MCP allowlist from the language server
-    return copilotLanguageServerConnection.getMcpAllowlist(new NullParams());
+    return copilotLanguageServerConnection.getMcpAllowlist(new NullParams()).exceptionally(exception -> {
+      if (isInvalidAllowlistFormat(exception)) {
+        return null;
+      }
+      if (exception instanceof RuntimeException runtimeException) {
+        throw runtimeException;
+      }
+      throw new IllegalStateException(exception);
+    });
+  }
+
+  private static boolean isInvalidAllowlistFormat(Throwable exception) {
+    Throwable cause = exception;
+    while (cause != null) {
+      if (StringUtils.startsWith(cause.getMessage(), INVALID_ALLOWLIST_FORMAT_PREFIX)) {
+        return true;
+      }
+      cause = cause.getCause();
+    }
+    return false;
   }
 
   /**
