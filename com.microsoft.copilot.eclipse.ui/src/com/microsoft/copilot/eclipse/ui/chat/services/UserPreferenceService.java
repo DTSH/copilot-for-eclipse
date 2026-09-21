@@ -8,6 +8,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 import org.apache.commons.lang3.StringUtils;
 import org.eclipse.core.databinding.observable.sideeffect.ISideEffect;
@@ -29,11 +30,13 @@ import com.microsoft.copilot.eclipse.core.chat.CustomChatMode;
 import com.microsoft.copilot.eclipse.core.chat.CustomChatModeManager;
 import com.microsoft.copilot.eclipse.core.chat.InputNavigation;
 import com.microsoft.copilot.eclipse.core.chat.UserPreference;
+import com.microsoft.copilot.eclipse.core.chat.service.ICustomizationFileService.CustomizationType;
 import com.microsoft.copilot.eclipse.core.events.CopilotEventConstants;
 import com.microsoft.copilot.eclipse.core.lsp.CopilotLanguageServerConnection;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.ChatMode;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotStatusResult;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.DidChangeFeatureFlagsParams;
+import com.microsoft.copilot.eclipse.ui.CopilotUi;
 import com.microsoft.copilot.eclipse.ui.chat.ChatView;
 import com.microsoft.copilot.eclipse.ui.chat.Messages;
 import com.microsoft.copilot.eclipse.ui.preferences.CustomModesPreferencePage;
@@ -60,6 +63,8 @@ public class UserPreferenceService extends ChatBaseService implements CopilotAut
   private IEventBroker eventBroker;
   private EventHandler authStatusChangedEventHandler;
   private EventHandler featureFlagNotifiedEventHandler;
+  private EventHandler customizationFilesChangedEventHandler;
+  private CompletableFuture<Void> chatModeReload = CompletableFuture.completedFuture(null);
 
   /**
    * Constructor for the UserPreferenceService.
@@ -123,6 +128,13 @@ public class UserPreferenceService extends ChatBaseService implements CopilotAut
         });
       }
     };
+
+    customizationFilesChangedEventHandler = event -> {
+      Object property = event.getProperty(IEventBroker.DATA);
+      if (property == CustomizationType.AGENT) {
+        reloadChatModes();
+      }
+    };
   }
 
   private void subscribeToEvents() {
@@ -130,6 +142,8 @@ public class UserPreferenceService extends ChatBaseService implements CopilotAut
     if (eventBroker != null) {
       eventBroker.subscribe(CopilotEventConstants.TOPIC_AUTH_STATUS_CHANGED, authStatusChangedEventHandler);
       eventBroker.subscribe(CopilotEventConstants.TOPIC_CHAT_DID_CHANGE_FEATURE_FLAGS, featureFlagNotifiedEventHandler);
+      eventBroker.subscribe(CopilotEventConstants.TOPIC_CHAT_DID_CHANGE_CUSTOMIZATION_FILES,
+          customizationFilesChangedEventHandler);
     } else {
       CopilotCore.LOGGER.error(new IllegalStateException("Event broker is null"));
     }
@@ -344,18 +358,28 @@ public class UserPreferenceService extends ChatBaseService implements CopilotAut
    * the dropdown. Built-in modes are loaded once at startup and don't need reloading.
    */
   public void reloadChatModes() {
-    // Sync custom modes from LS (built-in modes are loaded once at startup)
-    CustomChatModeManager.INSTANCE.syncCustomModesFromService().thenRun(() -> {
-      ensureRealm(() -> {
-        String[] currentModes = chatModeObservable.getValue();
-        String[] updatedModes = getAvailableChatModes();
+    reloadChatModesAsync();
+  }
 
-        // Only update if the modes have changed
-        if (!Arrays.deepEquals(currentModes, updatedModes)) {
-          chatModeObservable.setValue(updatedModes);
-        }
-      });
-    });
+  private synchronized CompletableFuture<Void> reloadChatModesAsync() {
+    chatModeReload = chatModeReload.handle((ignored, error) -> null)
+        .thenCompose(ignored -> CustomChatModeManager.INSTANCE.syncCustomModesFromService())
+        .thenRun(() -> {
+          var settingManager = CopilotUi.getPlugin().getLanguageServerSettingManager();
+          if (settingManager != null) {
+            settingManager.syncCustomAgentToolPreferences();
+          }
+          ensureRealm(() -> {
+            String[] currentModes = chatModeObservable.getValue();
+            String[] updatedModes = getAvailableChatModes();
+
+            // Only update if the modes have changed
+            if (!Arrays.deepEquals(currentModes, updatedModes)) {
+              chatModeObservable.setValue(updatedModes);
+            }
+          });
+        });
+    return chatModeReload;
   }
 
   /**
@@ -373,8 +397,7 @@ public class UserPreferenceService extends ChatBaseService implements CopilotAut
           SwtUtils.getDisplay().getActiveShell(), CustomModesPreferencePage.ID,
           PreferencesUtils.getAllPreferenceIds(), null);
       dialog.open();
-      CustomChatModeManager.INSTANCE.syncCustomModesFromService().thenAccept(v -> {
-        ensureRealm(() -> chatModeObservable.setValue(getAvailableChatModes()));
+      reloadChatModesAsync().thenRun(() -> {
         String current = restoreChatModeName();
         if (isModeAvailable(current)) {
           // Mode is still available; explicitly refresh the picker so its displayed
@@ -583,8 +606,10 @@ public class UserPreferenceService extends ChatBaseService implements CopilotAut
     if (eventBroker != null) {
       eventBroker.unsubscribe(authStatusChangedEventHandler);
       eventBroker.unsubscribe(featureFlagNotifiedEventHandler);
+      eventBroker.unsubscribe(customizationFilesChangedEventHandler);
       authStatusChangedEventHandler = null;
       featureFlagNotifiedEventHandler = null;
+      customizationFilesChangedEventHandler = null;
       eventBroker = null;
     }
   }

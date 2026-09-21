@@ -139,6 +139,10 @@ public class AgentToolService implements ToolInvocationListener, TerminalService
 
     return lsConnection.registerTools(registerToolsParams).thenApply(toolList -> {
       cachedBuiltInTools = toolList;
+      var settingManager = CopilotUi.getPlugin().getLanguageServerSettingManager();
+      if (settingManager != null) {
+        settingManager.updateAvailableBuiltInTools(toolList);
+      }
       return toolList;
     });
   }
@@ -194,6 +198,15 @@ public class AgentToolService implements ToolInvocationListener, TerminalService
    */
   public List<LanguageModelToolInformation> getBuiltInTools() {
     return cachedBuiltInTools != null ? Collections.unmodifiableList(cachedBuiltInTools) : Collections.emptyList();
+  }
+
+  /**
+   * Checks whether the built-in tool inventory has already been returned by the language server.
+   *
+   * @return true if the inventory has been initialized, false otherwise
+   */
+  public boolean hasBuiltInToolsInventory() {
+    return cachedBuiltInTools != null;
   }
 
   /**

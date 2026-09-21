@@ -16,6 +16,9 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 import com.google.gson.JsonObject;
 import org.eclipse.core.net.proxy.IProxyData;
@@ -32,8 +35,13 @@ import org.mockito.quality.Strictness;
 
 import com.microsoft.copilot.eclipse.core.Constants;
 import com.microsoft.copilot.eclipse.core.lsp.CopilotLanguageServerConnection;
+import com.microsoft.copilot.eclipse.core.lsp.mcp.McpServerToolsCollection;
+import com.microsoft.copilot.eclipse.core.lsp.mcp.McpToolInformation;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings.CopilotSettings;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.LanguageModelToolInformation;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateConversationToolsStatusParams;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateMcpToolsStatusParams;
 import com.microsoft.copilot.eclipse.core.utils.GsonUtils;
 import com.microsoft.copilot.eclipse.core.utils.PlatformUtils;
 import com.microsoft.copilot.eclipse.ui.CopilotUi;
@@ -256,14 +264,12 @@ class LanguageServerSettingManagerTests {
   }
 
   @Test
-  void testInitializeMcpToolsStatusWhenEmpty() {
+  void testInitializeMcpToolsStatusWaitsForInventory() {
     // arrange
     when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
     when(mockPreferenceStore.getString(Constants.PROXY_KERBEROS_SP)).thenReturn(null);
     when(mockPreferenceStore.getString(Constants.GITHUB_ENTERPRISE)).thenReturn(null);
     when(mockPreferenceStore.getString(Constants.CUSTOM_INSTRUCTIONS_GIT_COMMIT)).thenReturn(null);
-    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn("");
-    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_STATUS)).thenReturn("");
 
     // act
     LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
@@ -271,9 +277,88 @@ class LanguageServerSettingManagerTests {
     assertDoesNotThrow(() -> manager.initializeMcpToolsStatus());
 
     // assert
-    verify(mockPreferenceStore, times(1)).getString(Constants.MCP_TOOLS_MODE_STATUS);
-    verify(mockPreferenceStore, times(1)).getString(Constants.MCP_TOOLS_STATUS);
     verify(mockLsConnection, times(0)).updateMcpToolsStatus(any());
+    verify(mockLsConnection, times(0)).updateConversationToolsStatus(any());
+  }
+
+  @Test
+  void testInitializeMcpToolsStatusSendsCustomModeIdToBothToolEndpoints() {
+    // arrange
+    String customModeId = "file:///workspace/.github/agents/custom.agent.md";
+    Map<String, Map<String, Map<String, Boolean>>> modeStatus = Map.of(customModeId,
+        Map.of(Messages.preferences_page_mcp_tools_builtin, Map.of("java_debugger", true),
+            "company/platform", Map.of("search", true)));
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn(GsonUtils.getDefault()
+        .toJson(modeStatus));
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_STATUS)).thenReturn("");
+    setupToolStatusUpdateFutures();
+
+    // act
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+    manager.updateAvailableBuiltInTools(List.of(tool("java_debugger")));
+    manager.updateAvailableMcpTools(List.of(server("company/platform", "search")));
+    manager.initializeMcpToolsStatus();
+
+    // assert
+    ArgumentCaptor<UpdateMcpToolsStatusParams> mcpParamsCaptor = ArgumentCaptor
+        .forClass(UpdateMcpToolsStatusParams.class);
+    verify(mockLsConnection).updateMcpToolsStatus(mcpParamsCaptor.capture());
+    assertEquals(customModeId, mcpParamsCaptor.getValue().getCustomChatModeId());
+
+    ArgumentCaptor<UpdateConversationToolsStatusParams> conversationParamsCaptor = ArgumentCaptor
+        .forClass(UpdateConversationToolsStatusParams.class);
+    verify(mockLsConnection).updateConversationToolsStatus(conversationParamsCaptor.capture());
+    assertEquals(customModeId, conversationParamsCaptor.getValue().getCustomChatModeId());
+  }
+
+  @Test
+  void testInitializeMcpToolsStatusSendsAgentModeWithoutCustomModeId() {
+    // arrange
+    Map<String, Map<String, Map<String, Boolean>>> modeStatus = Map.of(
+        CustomAgentToolStatusResolver.AGENT_MODE_ID,
+        Map.of(Messages.preferences_page_mcp_tools_builtin, Map.of("java_debugger", true)));
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn(GsonUtils.getDefault()
+        .toJson(modeStatus));
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_STATUS)).thenReturn("");
+    setupToolStatusUpdateFutures();
+
+    // act
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+    manager.updateAvailableBuiltInTools(List.of(tool("java_debugger")));
+    manager.updateAvailableMcpTools(List.of());
+    manager.initializeMcpToolsStatus();
+
+    // assert
+    ArgumentCaptor<UpdateConversationToolsStatusParams> conversationParamsCaptor = ArgumentCaptor
+        .forClass(UpdateConversationToolsStatusParams.class);
+    verify(mockLsConnection).updateConversationToolsStatus(conversationParamsCaptor.capture());
+    assertNull(conversationParamsCaptor.getValue().getCustomChatModeId());
+    verify(mockLsConnection, times(0)).updateMcpToolsStatus(any());
+  }
+
+  @Test
+  void testIsBuiltInToolEnabledForModeDoesNotInheritAgentMode() {
+    // arrange
+    String customModeId = "file:///workspace/.github/agents/custom.agent.md";
+    Map<String, Map<String, Map<String, Boolean>>> modeStatus = Map.of(
+        CustomAgentToolStatusResolver.AGENT_MODE_ID,
+        Map.of(Messages.preferences_page_mcp_tools_builtin, Map.of("java_debugger", true)));
+    when(mockPreferenceStore.getBoolean(Constants.AUTO_SHOW_COMPLETION)).thenReturn(true);
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS)).thenReturn(GsonUtils.getDefault()
+        .toJson(modeStatus));
+    when(mockPreferenceStore.getString(Constants.MCP_TOOLS_STATUS)).thenReturn("");
+
+    // act
+    LanguageServerSettingManager manager = new LanguageServerSettingManager(mockLsConnection, mockProxyService,
+        mockPreferenceStore);
+
+    // assert
+    assertTrue(manager.isBuiltInToolEnabledForMode(CustomAgentToolStatusResolver.AGENT_MODE_ID, "java_debugger"));
+    assertFalse(manager.isBuiltInToolEnabledForMode(customModeId, "java_debugger"));
   }
 
   @Test
@@ -331,5 +416,29 @@ class LanguageServerSettingManagerTests {
     CopilotLanguageServerSettings settings = manager.getSettings();
     assertEquals("HTTPS://proxy.example.com:3128", settings.getHttp().getProxy());
     assertEquals("testuser:testpass", settings.getHttp().getProxyAuthorization());
+  }
+
+  private void setupToolStatusUpdateFutures() {
+    when(mockLsConnection.updateMcpToolsStatus(any())).thenReturn(CompletableFuture.completedFuture(List.of()));
+    when(mockLsConnection.updateConversationToolsStatus(any())).thenReturn(CompletableFuture.completedFuture(new Object()));
+  }
+
+  private static LanguageModelToolInformation tool(String name) {
+    LanguageModelToolInformation tool = new LanguageModelToolInformation();
+    tool.setName(name);
+    return tool;
+  }
+
+  private static McpServerToolsCollection server(String name, String... toolNames) {
+    McpServerToolsCollection server = new McpServerToolsCollection();
+    server.setName(name);
+    server.setTools(List.of(toolNames).stream().map(LanguageServerSettingManagerTests::mcpTool).toList());
+    return server;
+  }
+
+  private static McpToolInformation mcpTool(String name) {
+    McpToolInformation tool = new McpToolInformation();
+    tool.setName(name);
+    return tool;
   }
 }

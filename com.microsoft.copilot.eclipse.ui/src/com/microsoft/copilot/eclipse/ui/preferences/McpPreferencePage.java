@@ -20,9 +20,6 @@ import com.google.gson.Gson;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
 import org.apache.commons.lang3.StringUtils;
-import org.eclipse.core.resources.IFile;
-import org.eclipse.core.resources.IResource;
-import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.OperationCanceledException;
@@ -53,7 +50,6 @@ import org.eclipse.swt.widgets.Label;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.swt.widgets.Tree;
 import org.eclipse.swt.widgets.TreeItem;
-import org.eclipse.ui.IEditorPart;
 import org.eclipse.ui.ISharedImages;
 import org.eclipse.ui.IWorkbench;
 import org.eclipse.ui.IWorkbenchPreferencePage;
@@ -76,7 +72,6 @@ import com.microsoft.copilot.eclipse.ui.chat.services.McpExtensionPointManager;
 import com.microsoft.copilot.eclipse.ui.dialogs.mcp.McpRegistryDialog;
 import com.microsoft.copilot.eclipse.ui.utils.McpUtils;
 import com.microsoft.copilot.eclipse.ui.utils.SwtUtils;
-import com.microsoft.copilot.eclipse.ui.utils.UiUtils;
 
 /**
  * Preference page for GitHub Copilot MCP settings.
@@ -94,7 +89,11 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
   private boolean hasFailedMcpServer;
   private Combo modeSelector;
   private Composite modeSelectorComposite;
-  private String currentModeId = "agent-mode";
+  private String currentModeId = CustomAgentToolStatusResolver.AGENT_MODE_ID;
+  private List<String> modeOptionIds = new ArrayList<>();
+  private List<McpServerToolsCollection> currentMcpServers = new ArrayList<>();
+  private final CustomAgentToolStatusResolver toolStatusResolver = new CustomAgentToolStatusResolver(
+      Messages.preferences_page_mcp_tools_builtin);
 
   //formatter:off
   /**
@@ -597,6 +596,9 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
       return;
     }
 
+    currentMcpServers = servers != null ? new ArrayList<>(servers) : new ArrayList<>();
+    syncModeToolStatusFromCustomModes();
+
     // Sync custom modes from service to ensure we have the latest agent configurations
     // This handles external modifications to .agent.md files
     syncCustomModesAndRefreshModeSelector();
@@ -617,25 +619,14 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
         ? modeToolStatus.get(currentModeId)
         : new HashMap<>();
 
-    // Fetch built-in tools from AgentToolService
-    // Get cached built-in tools that were registered at initialization
-    try {
-      var chatServiceManager = CopilotUi.getPlugin().getChatServiceManager();
-      if (chatServiceManager != null) {
-        var agentToolService = chatServiceManager.getAgentToolService();
-        if (agentToolService != null) {
-          var builtInTools = agentToolService.getBuiltInTools();
-          if (!builtInTools.isEmpty()) {
-            addBuiltInToolsToTree(builtInTools, savedServerToolStatusMap);
-          }
-        }
-      }
-    } catch (Exception e) {
-      CopilotCore.LOGGER.error("Failed to fetch built-in tools", e);
+    // Fetch built-in tools from AgentToolService.
+    List<LanguageModelToolInformation> builtInTools = getAvailableBuiltInTools();
+    if (builtInTools != null && !builtInTools.isEmpty()) {
+      addBuiltInToolsToTree(builtInTools, savedServerToolStatusMap);
     }
 
     // Add MCP servers and tools to the tree
-    for (McpServerToolsCollection server : servers) {
+    for (McpServerToolsCollection server : currentMcpServers) {
       if (server == null) {
         continue;
       }
@@ -645,11 +636,18 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
       boolean isBlocked = server.getStatus() == McpServerStatus.blocked;
 
       // Store blocked status in the tree item data for disabled reference
+      serverNode.setData("serverName", server.getName());
       serverNode.setData("blocked", isBlocked);
 
       if (isBlocked) {
         serverNode.setGrayed(true);
         serverNode.setChecked(false);
+      }
+
+      if (server.getTools() == null) {
+        serverNode.setExpanded(true);
+        updateServerCheckStatus(serverNode);
+        continue;
       }
 
       for (LanguageModelToolInformation tool : server.getTools()) {
@@ -662,7 +660,7 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
 
         // For agent mode, default new tools to enabled; for custom agents default to disabled
         boolean shouldEnable = false;
-        if ("agent-mode".equals(currentModeId)) {
+        if (CustomAgentToolStatusResolver.AGENT_MODE_ID.equals(currentModeId)) {
           // Check if this tool exists in saved status
           if (savedServerToolStatusMap.containsKey(server.getName())
               && savedServerToolStatusMap.get(server.getName()).containsKey(tool.getName())) {
@@ -679,6 +677,7 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
         }
 
         toolNode.setChecked(isBlocked ? false : shouldEnable);
+        toolNode.setData("serverName", server.getName());
         toolNode.setData("toolName", tool.getName());
         toolNode.setData("blocked", isBlocked);
 
@@ -698,11 +697,10 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
         if (e.detail == SWT.CHECK) {
           TreeItem item = (TreeItem) e.item;
 
-          // Check if the item is blocked - if so, prevent the action
-          boolean isBlocked = (Boolean) item.getData("blocked");
-          if (isBlocked) {
-            // Revert the check state change for blocked items
-            item.setChecked(false);
+          // Check if the item is blocked or the current mode is file-controlled - if so, prevent the action.
+          boolean isBlocked = Boolean.TRUE.equals(item.getData("blocked"));
+          if (isBlocked || !isCurrentModeToolStatusEditable()) {
+            loadModeToolStatus(currentModeId);
             return;
           }
 
@@ -767,25 +765,14 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
     serverNode.setGrayed(false);
   }
 
-  private void saveToolStatusToPreferences() {
-    if (toolsTree == null || toolsTree.isDisposed()) {
+  private void saveAgentModeToolStatusToLegacyPreference() {
+    Map<String, Map<String, Boolean>> agentModeStatus = modeToolStatus.get(
+        CustomAgentToolStatusResolver.AGENT_MODE_ID);
+    if (agentModeStatus == null) {
       return;
     }
 
-    Map<String, Map<String, Boolean>> serverToolStatus = new HashMap<>();
-    for (TreeItem serverNode : toolsTree.getItems()) {
-      String serverName = serverNode.getText();
-      Map<String, Boolean> toolStatus = new HashMap<>();
-      for (TreeItem toolNode : serverNode.getItems()) {
-        String toolName = (String) toolNode.getData("toolName");
-        if (StringUtils.isNotBlank(serverName)) {
-          toolStatus.put(toolName, toolNode.getChecked());
-        }
-      }
-      serverToolStatus.put(serverName, toolStatus);
-    }
-
-    String jsonResult = GSON.toJson(serverToolStatus);
+    String jsonResult = GSON.toJson(agentModeStatus);
     IPreferenceStore preferenceStore = getPreferenceStore();
     preferenceStore.setValue(Constants.MCP_TOOLS_STATUS, jsonResult);
   }
@@ -814,11 +801,8 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
   public boolean performOk() {
     // Save current mode's tool status before saving all
     saveModeToolStatus(currentModeId);
-    // Only save to MCP_TOOLS_STATUS when in agent mode (for backward compatibility)
-    if ("agent-mode".equals(currentModeId)) {
-      saveToolStatusToPreferences();
-    }
     saveModeToolStatusToPreferences();
+    saveAgentModeToolStatusToLegacyPreference();
     saveMcpRegistryUrlToGlobalScope();
     resyncMcpServers();
 
@@ -833,6 +817,10 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
    */
   private void updateAllModesToolStatus() {
     LanguageServerSettingManager lsManager = CopilotUi.getPlugin().getLanguageServerSettingManager();
+    if (lsManager == null) {
+      CopilotCore.LOGGER.error(new IllegalStateException("LanguageServerSettingManager is not available."));
+      return;
+    }
 
     // Update tool status for each mode
     for (Map.Entry<String, Map<String, Map<String, Boolean>>> modeEntry : modeToolStatus.entrySet()) {
@@ -845,46 +833,6 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
       // Update via LSP with mode context
       lsManager.updateToolStatusForMode(toolStatusJson, modeId);
     }
-
-    reloadAgentFilesFromDisk();
-  }
-
-  /**
-   * Reload all open .agent.md files from disk to pick up changes made by the language server.
-   */
-  private void reloadAgentFilesFromDisk() {
-    // Collect agent files on UI thread
-    List<IFile> filesToRefresh = new ArrayList<>();
-    for (IEditorPart editor : UiUtils.findAllOpenAgentFiles()) {
-      IFile file = UiUtils.getFileFromEditorPart(editor);
-      if (file != null && file.exists()) {
-        filesToRefresh.add(file);
-      }
-    }
-
-    if (filesToRefresh.isEmpty()) {
-      return;
-    }
-
-    // Refresh files in background thread since refreshLocal can be long-running
-    Job refreshJob = new Job("Refreshing agent files") {
-      @Override
-      protected IStatus run(IProgressMonitor monitor) {
-        for (IFile file : filesToRefresh) {
-          try {
-            file.refreshLocal(IResource.DEPTH_ZERO, monitor);
-          } catch (CoreException e) {
-            CopilotCore.LOGGER.error("Failed to refresh " + file.getName(), e);
-          } catch (OperationCanceledException e) {
-            // User cancelled, stop refreshing remaining files
-            break;
-          }
-        }
-        return Status.OK_STATUS;
-      }
-    };
-    refreshJob.setSystem(true);
-    refreshJob.schedule();
   }
 
   /**
@@ -902,7 +850,7 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
         try {
           // Re-initialize mode tool status from the updated custom modes
           // This reads the tools: [] list from the updated .agent.md files
-          initializeModeToolStatusFromCustomModes();
+          syncModeToolStatusFromCustomModes();
 
           // Reload mode options - this will also call selectModeById and loadModeToolStatus internally
           // which updates the checkboxes to reflect the new tool configuration
@@ -948,7 +896,9 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
    */
   private void loadModeOptions() {
     List<String> options = new ArrayList<>();
+    List<String> optionIds = new ArrayList<>();
     options.add(Messages.preferences_page_mcp_tools_agent_mode);
+    optionIds.add(CustomAgentToolStatusResolver.AGENT_MODE_ID);
 
     // Add custom agents
     try {
@@ -961,11 +911,13 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
           continue;
         }
         options.add(workspaceName + ": " + mode.getDisplayName());
+        optionIds.add(mode.getId());
       }
     } catch (Exception e) {
       CopilotCore.LOGGER.error("Failed to load custom agents", e);
     }
 
+    modeOptionIds = optionIds;
     modeSelector.setItems(options.toArray(new String[0]));
 
     // Select the current mode
@@ -980,30 +932,27 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
       return;
     }
 
-    if ("agent-mode".equals(modeId)) {
+    if (CustomAgentToolStatusResolver.AGENT_MODE_ID.equals(modeId)) {
       modeSelector.select(0);
+      currentModeId = modeId;
+      if (toolsTree != null && !toolsTree.isDisposed()) {
+        loadModeToolStatus(modeId);
+      }
     } else {
-      // Find the custom agent
-      try {
-        List<CustomChatMode> customModes = CustomChatModeManager.INSTANCE.getCustomModes();
-        for (int i = 0; i < customModes.size(); i++) {
-          if (customModes.get(i).getId().equals(modeId)) {
-            modeSelector.select(i + 1); // +1 because agent mode is at index 0
-            currentModeId = modeId;
-            // Load the tool status for this mode
-            if (toolsTree != null && !toolsTree.isDisposed()) {
-              loadModeToolStatus(modeId);
-            }
-            return;
-          }
+      int optionIndex = modeOptionIds.indexOf(modeId);
+      if (optionIndex >= 0) {
+        modeSelector.select(optionIndex);
+        currentModeId = modeId;
+        // Load the tool status for this mode
+        if (toolsTree != null && !toolsTree.isDisposed()) {
+          loadModeToolStatus(modeId);
         }
-      } catch (Exception e) {
-        CopilotCore.LOGGER.error("Failed to select mode by ID: " + modeId, e);
+        return;
       }
 
       // If mode not found, default to agent mode
       modeSelector.select(0);
-      currentModeId = "agent-mode";
+      currentModeId = CustomAgentToolStatusResolver.AGENT_MODE_ID;
     }
   }
 
@@ -1015,50 +964,15 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
     saveModeToolStatus(currentModeId);
 
     // Update current mode ID
-    String selectedText = modeSelector.getText();
-    currentModeId = extractModeIdFromSelection(selectedText);
+    int selectedIndex = modeSelector.getSelectionIndex();
+    if (selectedIndex >= 0 && selectedIndex < modeOptionIds.size()) {
+      currentModeId = modeOptionIds.get(selectedIndex);
+    } else {
+      currentModeId = CustomAgentToolStatusResolver.AGENT_MODE_ID;
+    }
 
     // Load the tool status for the new mode (updates checkboxes on existing tree)
     loadModeToolStatus(currentModeId);
-  }
-
-  /**
-   * Extract mode ID from selection text.
-   */
-  private String extractModeIdFromSelection(String selectionText) {
-    if (selectionText.equals(Messages.preferences_page_mcp_tools_agent_mode)) {
-      return "agent-mode";
-    } else {
-      // Extract workspace name and display name from the selection text
-      // Format: "workspace: displayName"
-      String workspaceName;
-      String displayName;
-
-      if (selectionText.contains(": ")) {
-        int colonIndex = selectionText.indexOf(": ");
-        workspaceName = selectionText.substring(0, colonIndex);
-        displayName = selectionText.substring(colonIndex + 2);
-      } else {
-        CopilotCore.LOGGER.info("Invalid mode selection format (missing ': '): " + selectionText);
-        return "agent-mode";
-      }
-
-      try {
-        List<CustomChatMode> customModes = CustomChatModeManager.INSTANCE.getCustomModes();
-        for (CustomChatMode mode : customModes) {
-          // Match both display name and workspace name to ensure uniqueness
-          if (mode.getDisplayName().equals(displayName)) {
-            String modeWorkspaceName = getWorkspaceNameForMode(mode);
-            if (workspaceName.equals(modeWorkspaceName)) {
-              return mode.getId();
-            }
-          }
-        }
-      } catch (Exception e) {
-        CopilotCore.LOGGER.error("Failed to extract mode ID", e);
-      }
-    }
-    return "agent-mode";
   }
 
   /**
@@ -1097,76 +1011,48 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
 
     if (StringUtils.isNotBlank(json)) {
       try {
-        modeToolStatus = GSON.fromJson(json,
+        Map<String, Map<String, Map<String, Boolean>>> parsedModeToolStatus = GSON.fromJson(json,
             new com.google.gson.reflect.TypeToken<Map<String, Map<String, Map<String, Boolean>>>>() {
             }.getType());
+        modeToolStatus = parsedModeToolStatus != null ? parsedModeToolStatus : new HashMap<>();
       } catch (Exception e) {
         CopilotCore.LOGGER.error("Failed to parse MCP mode tools status JSON", e);
         modeToolStatus = new HashMap<>();
       }
     }
 
-    // Initialize mode tool status from custom agent definitions loaded from LSP
-    initializeModeToolStatusFromCustomModes();
+    addLegacyAgentModeStatusIfNeeded();
+    syncModeToolStatusFromCustomModes();
   }
 
-  /**
-   * Initialize mode tool status for custom agents based on their .agent.md file definitions.
-   * This method fully synchronizes the tool configuration from the LSP response, overwriting
-   * any existing user preferences to ensure the preference page always reflects the current
-   * agent definition from .agent.md files.
-   */
-  private void initializeModeToolStatusFromCustomModes() {
+  private void syncModeToolStatusFromCustomModes() {
     try {
-      List<CustomChatMode> customModes = CustomChatModeManager.INSTANCE.getCustomModes();
+      modeToolStatus = toolStatusResolver.resolveCustomAgentToolStatus(CustomChatModeManager.INSTANCE.getCustomModes(),
+          modeToolStatus, getAvailableBuiltInTools(), currentMcpServers);
+    } catch (Exception e) {
+      CopilotCore.LOGGER.error("Failed to synchronize mode tool status from custom agents", e);
+    }
+  }
 
-      // Collect all valid mode IDs (agent-mode + custom agents)
-      Set<String> validModeIds = new HashSet<>();
-      validModeIds.add("agent-mode"); // Always keep agent-mode
+  private void addLegacyAgentModeStatusIfNeeded() {
+    if (modeToolStatus.containsKey(CustomAgentToolStatusResolver.AGENT_MODE_ID)) {
+      return;
+    }
 
-      for (CustomChatMode mode : customModes) {
-        validModeIds.add(mode.getId());
-      }
+    String json = getPreferenceStore().getString(Constants.MCP_TOOLS_STATUS);
+    if (StringUtils.isBlank(json)) {
+      return;
+    }
 
-      // Remove tool status for non-existing modes
-      modeToolStatus.keySet().removeIf(modeId -> !validModeIds.contains(modeId));
-
-      for (CustomChatMode mode : customModes) {
-        String modeId = mode.getId();
-        List<String> toolsFromFile = mode.getTools();
-
-        // Always sync tool status from .agent.md file, overwriting any existing preferences
-        // This ensures the preference page always reflects the current agent definition from LSP
-        Map<String, Map<String, Boolean>> newModeStatus = new HashMap<>();
-
-        if (toolsFromFile != null && !toolsFromFile.isEmpty()) {
-          for (String toolSpec : toolsFromFile) {
-            String serverName;
-            String toolName;
-
-            // Parse tool specification: either "tool" or "server/tool"
-            // For server names containing "/", use lastIndexOf to split from the rightmost "/"
-            if (toolSpec.contains("/")) {
-              int lastSlashIndex = toolSpec.lastIndexOf("/");
-              serverName = toolSpec.substring(0, lastSlashIndex);
-              toolName = toolSpec.substring(lastSlashIndex + 1);
-            } else {
-              // Built-in tool
-              serverName = Messages.preferences_page_mcp_tools_builtin;
-              toolName = toolSpec;
-            }
-
-            // Get or create server map
-            Map<String, Boolean> serverTools = newModeStatus.computeIfAbsent(serverName, k -> new HashMap<>());
-            serverTools.put(toolName, true); // Enable tools from .agent.md
-          }
-        }
-        // If no tools are defined, newModeStatus remains empty, effectively clearing deleted tools
-
-        modeToolStatus.put(modeId, newModeStatus);
+    try {
+      Map<String, Map<String, Boolean>> legacyStatus = GSON.fromJson(json,
+          new com.google.gson.reflect.TypeToken<Map<String, Map<String, Boolean>>>() {
+          }.getType());
+      if (legacyStatus != null && !legacyStatus.isEmpty()) {
+        modeToolStatus.put(CustomAgentToolStatusResolver.AGENT_MODE_ID, legacyStatus);
       }
     } catch (Exception e) {
-      CopilotCore.LOGGER.error("Failed to initialize mode tool status from custom agents", e);
+      CopilotCore.LOGGER.error("Failed to parse legacy MCP tools status JSON", e);
     }
   }
 
@@ -1187,13 +1073,28 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
       return;
     }
 
+    CustomChatMode customMode = getCustomMode(modeId);
+    if (customMode != null && !toolStatusResolver.isToolStatusEditable(customMode)) {
+      Map<String, Map<String, Boolean>> resolvedStatus = toolStatusResolver.resolveModeToolStatus(customMode,
+          modeToolStatus.get(modeId), getAvailableBuiltInTools(), currentMcpServers);
+      if (resolvedStatus != null) {
+        modeToolStatus.put(modeId, resolvedStatus);
+      }
+      return;
+    }
+
     Map<String, Map<String, Boolean>> serverToolStatus = new HashMap<>();
     for (TreeItem serverNode : toolsTree.getItems()) {
-      String serverName = extractServerName(serverNode.getText());
+      String serverName = (String) serverNode.getData("serverName");
+      if (StringUtils.isBlank(serverName)) {
+        continue;
+      }
       Map<String, Boolean> toolStatus = new HashMap<>();
       for (TreeItem toolNode : serverNode.getItems()) {
-        String toolName = extractToolName(toolNode.getText());
-        toolStatus.put(toolName, toolNode.getChecked());
+        String toolName = (String) toolNode.getData("toolName");
+        if (StringUtils.isNotBlank(toolName)) {
+          toolStatus.put(toolName, toolNode.getChecked());
+        }
       }
       serverToolStatus.put(serverName, toolStatus);
     }
@@ -1212,7 +1113,7 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
     Map<String, Map<String, Boolean>> serverToolStatus = modeToolStatus.get(modeId);
     if (serverToolStatus == null) {
       // No saved status for this mode - default all tools to checked for agent-mode
-      if ("agent-mode".equals(modeId)) {
+      if (CustomAgentToolStatusResolver.AGENT_MODE_ID.equals(modeId)) {
         for (TreeItem serverNode : toolsTree.getItems()) {
           updateToolsCheckStatus(serverNode);
           serverNode.setChecked(true);
@@ -1232,33 +1133,45 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
 
     // Load saved status
     for (TreeItem serverNode : toolsTree.getItems()) {
-      String serverName = extractServerName(serverNode.getText());
+      String serverName = (String) serverNode.getData("serverName");
       Map<String, Boolean> toolStatus = serverToolStatus.get(serverName);
 
       for (TreeItem toolNode : serverNode.getItems()) {
-        String toolName = extractToolName(toolNode.getText());
+        String toolName = (String) toolNode.getData("toolName");
         boolean isChecked = toolStatus != null ? toolStatus.getOrDefault(toolName, false) : false;
-        toolNode.setChecked(isChecked);
+        toolNode.setChecked(!Boolean.TRUE.equals(toolNode.getData("blocked")) && isChecked);
       }
 
       updateServerCheckStatus(serverNode);
     }
   }
 
-  /**
-   * Extract server name from tree item text (removes hints like " - registry info").
-   */
-  private String extractServerName(String text) {
-    int dashIndex = text.indexOf(" - ");
-    return dashIndex > 0 ? text.substring(0, dashIndex).trim() : text.trim();
+  private List<LanguageModelToolInformation> getAvailableBuiltInTools() {
+    try {
+      var chatServiceManager = CopilotUi.getPlugin().getChatServiceManager();
+      if (chatServiceManager == null || chatServiceManager.getAgentToolService() == null) {
+        return null;
+      }
+      var agentToolService = chatServiceManager.getAgentToolService();
+      if (!agentToolService.hasBuiltInToolsInventory()) {
+        return null;
+      }
+      return agentToolService.getBuiltInTools();
+    } catch (Exception e) {
+      CopilotCore.LOGGER.error("Failed to fetch built-in tools", e);
+      return null;
+    }
   }
 
-  /**
-   * Extract tool name from tree item text (removes description after " - ").
-   */
-  private String extractToolName(String text) {
-    int dashIndex = text.indexOf(" - ");
-    return dashIndex > 0 ? text.substring(0, dashIndex).trim() : text.trim();
+  private boolean isCurrentModeToolStatusEditable() {
+    return toolStatusResolver.isToolStatusEditable(getCustomMode(currentModeId));
+  }
+
+  private CustomChatMode getCustomMode(String modeId) {
+    if (!CustomAgentToolStatusResolver.isCustomModeId(modeId)) {
+      return null;
+    }
+    return CustomChatModeManager.INSTANCE.getCustomModeById(modeId);
   }
 
   /**
@@ -1322,6 +1235,7 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
       Map<String, Map<String, Boolean>> savedServerToolStatusMap) {
     TreeItem builtInServerNode = new TreeItem(toolsTree, SWT.NONE, 0);
     builtInServerNode.setText(Messages.preferences_page_mcp_tools_builtin);
+    builtInServerNode.setData("serverName", Messages.preferences_page_mcp_tools_builtin);
     builtInServerNode.setData("blocked", false);
 
     for (var tool : builtInTools) {
@@ -1331,12 +1245,13 @@ public class McpPreferencePage extends FieldEditorPreferencePage implements IWor
 
       TreeItem toolNode = new TreeItem(builtInServerNode, SWT.NONE);
       toolNode.setText(parseToolNameAndDisplayDescription(tool));
+      toolNode.setData("serverName", Messages.preferences_page_mcp_tools_builtin);
       toolNode.setData("blocked", false);
       toolNode.setData("toolName", tool.getName());
 
       // For agent mode, default new tools to enabled; for custom agents default to disabled
       boolean shouldEnable = false;
-      if ("agent-mode".equals(currentModeId)) {
+      if (CustomAgentToolStatusResolver.AGENT_MODE_ID.equals(currentModeId)) {
         // Check if this tool exists in saved status
         if (savedServerToolStatusMap.containsKey(Messages.preferences_page_mcp_tools_builtin)
             && savedServerToolStatusMap.get(Messages.preferences_page_mcp_tools_builtin).containsKey(tool.getName())) {

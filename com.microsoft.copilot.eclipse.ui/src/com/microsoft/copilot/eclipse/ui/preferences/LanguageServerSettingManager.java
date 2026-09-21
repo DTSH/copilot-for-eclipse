@@ -33,12 +33,14 @@ import com.microsoft.copilot.eclipse.core.chat.FileOperationAutoApproveRule;
 import com.microsoft.copilot.eclipse.core.chat.TerminalAutoApproveRule;
 import com.microsoft.copilot.eclipse.core.events.CopilotEventConstants;
 import com.microsoft.copilot.eclipse.core.lsp.CopilotLanguageServerConnection;
+import com.microsoft.copilot.eclipse.core.lsp.mcp.McpServerToolsCollection;
 import com.microsoft.copilot.eclipse.core.lsp.mcp.McpServerToolsStatusCollection;
 import com.microsoft.copilot.eclipse.core.lsp.mcp.McpToolStatus;
 import com.microsoft.copilot.eclipse.core.lsp.mcp.McpToolsStatusCollection;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.ConversationToolStatus;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.CopilotLanguageServerSettings.GitHubSettings;
+import com.microsoft.copilot.eclipse.core.lsp.protocol.LanguageModelToolInformation;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateConversationToolsStatusParams;
 import com.microsoft.copilot.eclipse.core.lsp.protocol.UpdateMcpToolsStatusParams;
 import com.microsoft.copilot.eclipse.core.utils.GsonUtils;
@@ -52,12 +54,17 @@ import com.microsoft.copilot.eclipse.ui.utils.PreferencesUtils;
  * A class to manage the proxy service for the Copilot Language Server.
  */
 public class LanguageServerSettingManager implements IProxyChangeListener, IPropertyChangeListener {
+  private static final String BUILT_IN_CHAT_MODE_KIND_AGENT = "Agent";
+
   IProxyService proxyService = null;
   CopilotLanguageServerSettings settings = new CopilotLanguageServerSettings();
   CopilotLanguageServerConnection copilotLanguageServerConnection = null;
   IPreferenceStore preferenceStore;
   IProxyData proxyData = null;
   private IEventBroker eventBroker;
+  private List<LanguageModelToolInformation> availableBuiltInTools;
+  private List<McpServerToolsCollection> availableMcpTools;
+  private boolean mcpToolStatusInitialized;
 
   /**
    * Gets the settings.
@@ -334,51 +341,145 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
   }
 
   /**
-   * Initializes the MCP tools status from the preference store for built-in agent mode only.
-   * Custom agent modes get their tool configuration from the LSP/file, not from preferences.
+   * Updates the known built-in tool inventory and retries mode status initialization.
    */
-  public void initializeMcpToolsStatus() {
-    // Load per-mode tool status
-    String savedModeToolsStatus = preferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS);
+  public synchronized void updateAvailableBuiltInTools(List<LanguageModelToolInformation> builtInTools) {
+    availableBuiltInTools = builtInTools != null ? new ArrayList<>(builtInTools) : new ArrayList<>();
+    initializeMcpToolsStatus();
+  }
 
-    if (StringUtils.isNotBlank(savedModeToolsStatus)) {
-      try {
-        Map<String, Map<String, Map<String, Boolean>>> modeToolStatus = GsonUtils.getDefault()
-            .fromJson(savedModeToolsStatus, new TypeToken<Map<String, Map<String, Map<String, Boolean>>>>() {
-            }.getType());
+  /**
+   * Updates the known MCP tool inventory.
+   */
+  public synchronized void updateAvailableMcpTools(List<McpServerToolsCollection> mcpTools) {
+    availableMcpTools = mcpTools != null ? new ArrayList<>(mcpTools) : new ArrayList<>();
+  }
 
-        // Only initialize tool status for built-in agent mode, not custom modes.
-        // Custom modes get their tool configuration from the LSP/file, not from preferences.
-        for (Map.Entry<String, Map<String, Map<String, Boolean>>> modeEntry : modeToolStatus.entrySet()) {
-          String modeId = modeEntry.getKey();
+  /**
+   * Initializes and synchronizes MCP tools status after both inventory sources are known.
+   */
+  public synchronized void initializeMcpToolsStatus() {
+    if (availableBuiltInTools == null || availableMcpTools == null) {
+      return;
+    }
 
-          // Skip custom agent modes - they should use tool configuration from their file/LSP
-          if (CustomChatModeManager.INSTANCE.isCustomMode(modeId)) {
-            continue;
-          }
+    Map<String, Map<String, Map<String, Boolean>>> modeToolStatus = loadModeToolStatusFromPreferences();
+    addLegacyAgentModeStatusIfNeeded(modeToolStatus);
+    modeToolStatus = new CustomAgentToolStatusResolver(Messages.preferences_page_mcp_tools_builtin)
+        .resolveCustomAgentToolStatus(CustomChatModeManager.INSTANCE.getCustomModes(), modeToolStatus,
+            availableBuiltInTools, availableMcpTools);
 
-          Map<String, Map<String, Boolean>> toolStatus = modeEntry.getValue();
-          String toolStatusJson = GsonUtils.getDefault().toJson(toolStatus);
-          updateToolStatusForMode(toolStatusJson, modeId);
-        }
-      } catch (Exception e) {
-        CopilotCore.LOGGER.error("Failed to parse MCP mode tools status JSON", e);
-      }
-    } else {
-      // Fallback to legacy MCP_TOOLS_STATUS for agent mode if MCP_TOOLS_MODE_STATUS is not available
-      String savedMcpToolsStatus = preferenceStore.getString(Constants.MCP_TOOLS_STATUS);
-      updateMcpToolsStatus(savedMcpToolsStatus, null);
+    preferenceStore.setValue(Constants.MCP_TOOLS_MODE_STATUS, GsonUtils.getDefault().toJson(modeToolStatus));
+    mcpToolStatusInitialized = true;
+
+    for (Map.Entry<String, Map<String, Map<String, Boolean>>> modeEntry : modeToolStatus.entrySet()) {
+      String toolStatusJson = GsonUtils.getDefault().toJson(modeEntry.getValue());
+      updateToolStatusForMode(toolStatusJson, modeEntry.getKey());
     }
   }
 
   /**
-   * Initializes the MCP tools status from the preference store with mode context.
+   * Initializes a specific mode from persisted preferences.
    *
    * @param modeId the mode ID (e.g., "agent-mode" or custom mode ID)
    */
   public void initializeMcpToolsStatus(String modeId) {
-    String savedMcpToolsStatus = preferenceStore.getString(Constants.MCP_TOOLS_STATUS);
-    updateMcpToolsStatus(savedMcpToolsStatus, modeId);
+    String normalizedModeId = normalizeToolStatusModeId(modeId);
+    Map<String, Map<String, Map<String, Boolean>>> modeToolStatus = loadModeToolStatusFromPreferences();
+    addLegacyAgentModeStatusIfNeeded(modeToolStatus);
+    Map<String, Map<String, Boolean>> toolStatus = modeToolStatus.get(normalizedModeId);
+    if (toolStatus != null) {
+      updateToolStatusForMode(GsonUtils.getDefault().toJson(toolStatus), normalizedModeId);
+    }
+  }
+
+  /**
+   * Synchronizes custom-agent preferences after custom agent files changed.
+   */
+  public void syncCustomAgentToolPreferences() {
+    initializeMcpToolsStatus();
+  }
+
+  /**
+   * Checks whether a built-in tool is enabled for a specific mode without falling back to agent-mode for custom modes.
+   */
+  public boolean isBuiltInToolEnabledForMode(String modeId, String toolName) {
+    if (StringUtils.isBlank(toolName)) {
+      return false;
+    }
+
+    String normalizedModeId = normalizeToolStatusModeId(modeId);
+    Map<String, Map<String, Map<String, Boolean>>> modeToolStatus = loadModeToolStatusFromPreferences();
+    addLegacyAgentModeStatusIfNeeded(modeToolStatus);
+    Map<String, Map<String, Boolean>> toolStatus = modeToolStatus.get(normalizedModeId);
+    if (toolStatus == null) {
+      return false;
+    }
+
+    Map<String, Boolean> builtInToolStatus = toolStatus.get(Messages.preferences_page_mcp_tools_builtin);
+    return builtInToolStatus != null && Boolean.TRUE.equals(builtInToolStatus.get(toolName));
+  }
+
+  private Map<String, Map<String, Map<String, Boolean>>> loadModeToolStatusFromPreferences() {
+    Map<String, Map<String, Map<String, Boolean>>> modeToolStatus = new LinkedHashMap<>();
+    String savedModeToolsStatus = preferenceStore.getString(Constants.MCP_TOOLS_MODE_STATUS);
+    if (StringUtils.isBlank(savedModeToolsStatus)) {
+      return modeToolStatus;
+    }
+
+    try {
+      Map<String, Map<String, Map<String, Boolean>>> parsed = GsonUtils.getDefault()
+          .fromJson(savedModeToolsStatus, new TypeToken<Map<String, Map<String, Map<String, Boolean>>>>() {
+          }.getType());
+      if (parsed != null) {
+        modeToolStatus.putAll(parsed);
+      }
+    } catch (Exception e) {
+      CopilotCore.LOGGER.error("Failed to parse MCP mode tools status JSON", e);
+    }
+    return modeToolStatus;
+  }
+
+  private void addLegacyAgentModeStatusIfNeeded(Map<String, Map<String, Map<String, Boolean>>> modeToolStatus) {
+    if (modeToolStatus.containsKey(CustomAgentToolStatusResolver.AGENT_MODE_ID)) {
+      return;
+    }
+
+    Map<String, Map<String, Boolean>> legacyStatus = parseToolStatus(
+        preferenceStore.getString(Constants.MCP_TOOLS_STATUS));
+    if (!legacyStatus.isEmpty()) {
+      modeToolStatus.put(CustomAgentToolStatusResolver.AGENT_MODE_ID, legacyStatus);
+    }
+  }
+
+  private Map<String, Map<String, Boolean>> parseToolStatus(String toolStatusJson) {
+    Map<String, Map<String, Boolean>> toolStatus = new LinkedHashMap<>();
+    if (StringUtils.isBlank(toolStatusJson)) {
+      return toolStatus;
+    }
+
+    try {
+      Map<String, Map<String, Boolean>> parsed = GsonUtils.getDefault().fromJson(toolStatusJson,
+          new TypeToken<Map<String, Map<String, Boolean>>>() {
+          }.getType());
+      if (parsed != null) {
+        toolStatus.putAll(parsed);
+      }
+    } catch (JsonSyntaxException e) {
+      CopilotCore.LOGGER.error("Failed to parse MCP tools status JSON", e);
+    }
+    return toolStatus;
+  }
+
+  private String normalizeToolStatusModeId(String modeId) {
+    if (CustomAgentToolStatusResolver.isCustomModeId(modeId)) {
+      return modeId;
+    }
+    if (StringUtils.equalsIgnoreCase(BUILT_IN_CHAT_MODE_KIND_AGENT, modeId)
+        || StringUtils.equals(CustomAgentToolStatusResolver.AGENT_MODE_ID, modeId)) {
+      return CustomAgentToolStatusResolver.AGENT_MODE_ID;
+    }
+    return modeId;
   }
 
   /**
@@ -420,7 +521,7 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
 
     // Set custom mode ID only if this is for a custom mode (ID starts with "file://")
     // For built-in agent mode, customChatModeId should not be set
-    if (modeId != null && modeId.startsWith("file://")) {
+    if (CustomAgentToolStatusResolver.isCustomModeId(modeId)) {
       mcpParams.setCustomChatModeId(modeId);
     }
 
@@ -456,24 +557,25 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
       serverList.add(serverToolsStatus);
     }
 
-    // Prepare futures for both operations
-    CompletableFuture<?> updateMcpToolsStatusFuture = null;
-    CompletableFuture<?> updateConversationToolsStatusFuture = null;
+    List<CompletableFuture<?>> updateFutures = new ArrayList<>();
 
     // Update MCP server tools
     if (!serverList.isEmpty()) {
-      updateMcpToolsStatusFuture = this.copilotLanguageServerConnection.updateMcpToolsStatus(mcpParams);
+      CompletableFuture<?> updateFuture = this.copilotLanguageServerConnection.updateMcpToolsStatus(mcpParams);
+      if (updateFuture != null) {
+        updateFutures.add(updateFuture);
+      }
     }
 
     // Update built-in tools using conversation/updateToolsStatus
     if (builtInTools != null && !builtInTools.isEmpty()) {
       UpdateConversationToolsStatusParams conversationParams = new UpdateConversationToolsStatusParams();
-      conversationParams.setChatModeKind("Agent");
+      conversationParams.setChatModeKind(BUILT_IN_CHAT_MODE_KIND_AGENT);
       conversationParams.setWorkspaceFolders(WorkspaceUtils.listWorkspaceFolders());
 
       // Set custom mode ID only if this is for a custom mode (ID starts with "file://")
       // For built-in agent mode, customChatModeId should not be set
-      if (modeId != null && modeId.startsWith("file://")) {
+      if (CustomAgentToolStatusResolver.isCustomModeId(modeId)) {
         conversationParams.setCustomChatModeId(modeId);
       }
 
@@ -486,20 +588,16 @@ public class LanguageServerSettingManager implements IProxyChangeListener, IProp
       }
       conversationParams.setTools(toolsList);
 
-      updateConversationToolsStatusFuture = this.copilotLanguageServerConnection
+      CompletableFuture<?> updateFuture = this.copilotLanguageServerConnection
           .updateConversationToolsStatus(conversationParams);
+      if (updateFuture != null) {
+        updateFutures.add(updateFuture);
+      }
     }
 
-    // Execute both futures sequentially in background
-    final CompletableFuture<?> mcpFuture = updateMcpToolsStatusFuture;
-    final CompletableFuture<?> conversationFuture = updateConversationToolsStatusFuture;
-    CompletableFuture.runAsync(() -> {
-      if (mcpFuture != null) {
-        mcpFuture.join();
-      }
-      if (conversationFuture != null) {
-        conversationFuture.join();
-      }
+    CompletableFuture.allOf(updateFutures.toArray(new CompletableFuture<?>[0])).exceptionally(ex -> {
+      CopilotCore.LOGGER.error("Failed to update tool status", ex);
+      return null;
     });
   }
 

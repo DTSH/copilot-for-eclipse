@@ -78,17 +78,22 @@ public class McpConfigService extends ChatBaseService implements IMcpConfigServi
     ensureRealm(() -> mcpToolsObservableValue = new WritableValue<>(new ArrayList<>(), List.class));
 
     mcpToolNotifiedEventHandler = event -> {
-      // On IDE startup: Initialize MCP tools status after MCP servers start.
-      // This event is always received because the event broker is set up before the setting manager syncs MCP servers
-      // to language server.
-      if (!mcpToolsInitialized) {
-        CopilotUi.getPlugin().getLanguageServerSettingManager().initializeMcpToolsStatus();
-        mcpToolsInitialized = true;
-      }
-
       Object params = event.getProperty(IEventBroker.DATA);
-      if (params instanceof List mcpServerTools) {
-        ensureRealm(() -> mcpToolsObservableValue.setValue(mcpServerTools));
+      if (params instanceof List<?> mcpServerTools) {
+        List<McpServerToolsCollection> serverTools = mcpServerTools.stream()
+            .filter(McpServerToolsCollection.class::isInstance)
+            .map(McpServerToolsCollection.class::cast)
+            .toList();
+        var settingManager = CopilotUi.getPlugin().getLanguageServerSettingManager();
+        if (settingManager != null) {
+          settingManager.updateAvailableMcpTools(serverTools);
+          // On IDE startup: initialize after the MCP inventory has been captured.
+          if (!mcpToolsInitialized) {
+            settingManager.initializeMcpToolsStatus();
+            mcpToolsInitialized = true;
+          }
+        }
+        ensureRealm(() -> mcpToolsObservableValue.setValue(serverTools));
       }
     };
 

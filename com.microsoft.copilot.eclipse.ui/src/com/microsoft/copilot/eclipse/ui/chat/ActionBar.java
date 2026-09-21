@@ -82,6 +82,7 @@ import com.microsoft.copilot.eclipse.ui.chat.tools.JavaDebuggerToolAdapter;
 import com.microsoft.copilot.eclipse.ui.dialogs.jobs.GitHubCodingAgentDialog;
 import com.microsoft.copilot.eclipse.ui.dialogs.jobs.ProjectSelectionDialog;
 import com.microsoft.copilot.eclipse.ui.i18n.Messages;
+import com.microsoft.copilot.eclipse.ui.preferences.CustomAgentToolStatusResolver;
 import com.microsoft.copilot.eclipse.ui.preferences.McpPreferencePage;
 import com.microsoft.copilot.eclipse.ui.swt.CssConstants;
 import com.microsoft.copilot.eclipse.ui.swt.DropdownButton;
@@ -690,7 +691,12 @@ public class ActionBar extends Composite implements NewConversationListener {
       return false;
     }
 
-    // Get the active mode and check if java_debugger is in its tools list from CLS
+    var settingManager = CopilotUi.getPlugin().getLanguageServerSettingManager();
+    if (settingManager == null) {
+      return false;
+    }
+
+    // Get the active mode and check the mode-specific preference status.
     String activeModeId = chatServiceManager.getUserPreferenceService().getActiveModeNameOrId();
     if (activeModeId == null) {
       return false;
@@ -699,13 +705,17 @@ public class ActionBar extends Composite implements NewConversationListener {
     // Check built-in modes
     BuiltInChatMode builtInMode = BuiltInChatModeManager.INSTANCE.getBuiltInModeByDisplayName(activeModeId);
     if (builtInMode != null) {
-      return builtInMode.getTools().contains(JavaDebuggerToolAdapter.TOOL_NAME);
+      if (BuiltInChatMode.AGENT_MODE_NAME.equalsIgnoreCase(builtInMode.getDisplayName())) {
+        return settingManager.isBuiltInToolEnabledForMode(CustomAgentToolStatusResolver.AGENT_MODE_ID,
+            JavaDebuggerToolAdapter.TOOL_NAME);
+      }
+      return false;
     }
 
     // Check custom modes
     CustomChatMode customMode = CustomChatModeManager.INSTANCE.getCustomModeById(activeModeId);
     if (customMode != null) {
-      return customMode.getTools().contains(JavaDebuggerToolAdapter.TOOL_NAME);
+      return settingManager.isBuiltInToolEnabledForMode(activeModeId, JavaDebuggerToolAdapter.TOOL_NAME);
     }
 
     return false;

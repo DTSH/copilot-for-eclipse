@@ -17,6 +17,7 @@ public abstract class BaseChatMode {
   protected String displayName;
   protected String description;
   protected List<String> tools;
+  protected boolean toolsConfigured;
   protected String model;
   protected List<HandOff> handOffs;
 
@@ -31,7 +32,8 @@ public abstract class BaseChatMode {
     this.id = id;
     this.displayName = displayName;
     this.description = description;
-    this.tools = new ArrayList<>();
+    this.tools = null;
+    this.toolsConfigured = false;
     this.handOffs = new ArrayList<>();
   }
 
@@ -50,7 +52,8 @@ public abstract class BaseChatMode {
     this.id = id;
     this.displayName = displayName;
     this.description = description;
-    this.tools = tools != null ? new ArrayList<>(tools) : new ArrayList<>();
+    this.tools = tools != null ? new ArrayList<>(tools) : null;
+    this.toolsConfigured = tools != null;
     this.model = model;
     this.handOffs = handOffs != null ? new ArrayList<>(handOffs) : new ArrayList<>();
   }
@@ -119,12 +122,22 @@ public abstract class BaseChatMode {
   }
 
   /**
+   * Determines whether the mode definition contains an explicit tools entry.
+   *
+   * @return true if tools were explicitly configured, false if the entry is absent
+   */
+  public boolean hasExplicitTools() {
+    return toolsConfigured;
+  }
+
+  /**
    * Set the tools list (defensive copy).
    *
    * @param tools the tools list to set
    */
   public void setTools(List<String> tools) {
-    this.tools = tools != null ? new ArrayList<>(tools) : new ArrayList<>();
+    this.tools = tools != null ? new ArrayList<>(tools) : null;
+    this.toolsConfigured = tools != null;
   }
 
   /**
